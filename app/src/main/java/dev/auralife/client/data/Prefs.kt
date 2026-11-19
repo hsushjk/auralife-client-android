@@ -41,6 +41,16 @@ class Prefs(ctx: Context) {
 
     fun clearLogin() = sp.edit { remove("token"); remove("user"); remove("name"); remove("role") }
 
+    /**
+     * 本地优先退出：只清登录态（token/role/name），
+     * 保留 base / user / theme / draft / lastRead，方便回来直接登录。
+     */
+    fun clearSession() = sp.edit {
+        remove("token")
+        remove("role")
+        remove("name")
+    }
+
     // 只填 IP 时补默认端口 2332
     fun normalizeBase(raw: String): String {
         var s = raw.trim()

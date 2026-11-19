@@ -34,6 +34,7 @@ import dev.auralife.client.net.Tls
 fun ConnectScreen(
     prefs: Prefs,
     onConnected: (AuraApi) -> Unit,
+    onNeedSetup: (AuraApi) -> Unit,
 ) {
     var base by remember { mutableStateOf(prefs.base) }
     var user by remember { mutableStateOf(prefs.user) }
@@ -52,7 +53,18 @@ fun ConnectScreen(
         busy = true
         msg = ""
         Thread {
-            val api = AuraApi(b)
+            // 进程内单实例（Activity/Service 共用）；base 变了或刚信任过证书时 rebuild 一次
+            val api = AuraApi.obtain(b, "").also { it.rebuild() }
+            // 服务端还没初始化：先看 /api/state（公开接口），needSetup 就走首次向导
+            val st = runCatching { api.state() }.getOrNull()
+            if (st?.optBoolean("ok") == true && st.optBoolean("needSetup", false)) {
+                prefs.base = b
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    busy = false
+                    onNeedSetup(api)
+                }
+                return@Thread
+            }
             val r = runCatching { api.login(user.trim(), pass) }
             val err = r.exceptionOrNull()
             val j = r.getOrNull()
@@ -72,8 +84,11 @@ fun ConnectScreen(
                 when {
                     ok -> onConnected(api)
                     fp != null -> cert = b.substringAfter("://").trimEnd('/') to fp
-                    else -> msg = err?.let { "连不上：${it.message}" }
-                        ?: (j?.optString("reason").takeUnless { it.isNullOrBlank() } ?: "登录没成功，检查用户名密码。")
+                    // 失败提示统一 reason ?? message ?? 默认（spec §0）
+                    else -> msg = err?.let { "连不上服务：${it.message}" }
+                        ?: (j?.optString("reason").takeUnless { it.isNullOrBlank() }
+                            ?: j?.optString("message").takeUnless { it.isNullOrBlank() }
+                            ?: "登录失败")
                 }
             }
         }.start()
@@ -124,7 +139,7 @@ fun ConnectScreen(
         Button(
             enabled = !busy,
             onClick = { attempt() },
-        ) { Text(if (busy) "连接中…" else "连接") }
+        ) { Text(if (busy) "登录中…" else "登录") }
     }
 
     cert?.let { (key, fp) ->

@@ -104,7 +104,7 @@ private val EDGE_VOICES = listOf(
 @Composable
 internal fun MasterSection(cfg: CfgState) {
     Panel("开关") {
-        Toggle("总开关", cfg.bool("enabled", true), hint = "整个停用：不回消息、不主动搭话、不写动态", onChange = { cfg.set("enabled", it) })
+        Toggle("总开关", cfg.bool("enabled", true), hint = "关掉后 Ta 休眠：不回复、不搭话、不整理记忆；再打开会从刚才的状态继续", onChange = { cfg.set("enabled", it) })
         Toggle("语音合成（TTS）", cfg.bool("voice.enabled", false), hint = "Ta 说出来的声音", onChange = { cfg.set("voice.enabled", it) })
         Toggle("语音识别（STT）", cfg.str("voice.asr") != "off", hint = "Ta 的耳朵：听你发来的语音条", onChange = { on ->
             cfg.set("voice.asr", if (on) "dsh" else "off")
@@ -242,7 +242,7 @@ internal fun ModelSection(api: AuraApi, cfg: CfgState) {
         PickRow(
             "思考强度",
             cfg.str("model.reasoningEffort", "low"),
-            listOf("off" to "关", "low" to "低", "high" to "高", "max" to "拉满", "custom" to "自定义"),
+            listOf("off" to "关", "low" to "低", "high" to "高", "max" to "满", "custom" to "自定义"),
         ) { cfg.set("model.reasoningEffort", it) }
         if (cfg.str("model.reasoningEffort", "low") == "custom") {
             CfgText("自定义强度（按平台文档填）", "model.reasoningEffortCustom", cfg)
@@ -276,7 +276,7 @@ internal fun VoiceSection(api: AuraApi, cfg: CfgState, onNote: (String) -> Unit)
             provider,
             listOf(
                 "edge" to "微软 edge-tts",
-                "windows" to "Windows 自带",
+                "windows" to "Windows 自带（仅 Windows）",
                 "custom" to "自定义接口",
             ),
         ) { cfg.set("voice.provider", it) }
@@ -570,12 +570,33 @@ internal fun GuestSection(api: AuraApi, onNote: (String) -> Unit) {
     var tick by remember { mutableStateOf(0) }
     var username by remember { mutableStateOf("") }
     var display by remember { mutableStateOf("") }
-    var level by remember { mutableStateOf("social") }
     var note by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var resetFor by remember { mutableStateOf("") }
     var newPw by remember { mutableStateOf("") }
+    var createdPw by remember { mutableStateOf<Pair<String, String>?>(null) }
     val scope = rememberCoroutineScope()
+
+    fun create(u: String) {
+        scope.launch {
+            val r = withContext(Dispatchers.IO) {
+                runCatching { SettingsApi.addGuest(api, u, display.trim().ifBlank { u }, "") }.getOrNull()
+            }
+            if (r?.optBoolean("ok") != true) {
+                note = msgOf(r)
+                onNote(note)
+                return@launch
+            }
+            // v1.91.78：客人只有「只聊天和空间」这一档，level 参数已取消（服务端也忽略）
+            val pw = r.optString("password")
+            if (pw.isNotBlank()) createdPw = u to pw
+            note = if (pw.isNotBlank()) "创建好了，一次性密码：$pw" else "创建好了"
+            onNote(note)
+            username = ""
+            display = ""
+            tick++
+        }
+    }
 
     Panel("客人") {
         LoadJson("guests-$tick", loader = { withContext(Dispatchers.IO) { runCatching { SettingsApi.guests(api) }.getOrNull() } }) { j ->
@@ -588,7 +609,7 @@ internal fun GuestSection(api: AuraApi, onNote: (String) -> Unit) {
                     Column(Modifier.weight(1f)) {
                         Text("${g.optString("displayName").ifBlank { g.optString("username") }}（${g.optString("username")}）", fontSize = 13.sp)
                         Text(
-                            (if (g.optString("level") == "full") "完全权限" else "只聊天日记") + g.optString("note").let { if (it.isBlank()) "" else " · $it" },
+                            "只聊天和空间" + g.optString("note").let { if (it.isBlank()) "" else " · $it" },
                             fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -603,24 +624,27 @@ internal fun GuestSection(api: AuraApi, onNote: (String) -> Unit) {
             Spacer(Modifier.height(6.dp))
             OutlinedTextField(username, { username = it }, label = { Text("用户名") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(display, { display = it }, label = { Text("昵称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            PickRow("权限", level, listOf("social" to "只聊天日记", "full" to "完全权限")) { level = it }
+            Hint("客人只能聊天和空间；密码只显示这一次。")
             TextButton(onClick = {
                 val u = username.trim()
-                if (u.isNotEmpty()) {
-                    scope.launch {
-                        val r = withContext(Dispatchers.IO) {
-                            runCatching { SettingsApi.addGuest(api, u, display.trim().ifBlank { u }, "", level) }.getOrNull()
-                        }
-                        note = msgOf(r) + (r?.optString("password")?.takeIf { it.isNotBlank() }?.let { " · 初始密码 $it" } ?: "")
-                        onNote(note)
-                        username = ""
-                        display = ""
-                        tick++
-                    }
+                if (u.isEmpty()) {
+                    note = "先填个用户名"
+                    onNote(note)
+                } else {
+                    create(u)
                 }
             }) { Text("创建", fontSize = 13.sp) }
             Hint(note)
         }
+    }
+
+    createdPw?.let { (name, pw) ->
+        AlertDialog(
+            onDismissRequest = { createdPw = null },
+            title = { Text("客人建好了") },
+            text = { Text("创建好了，一次性密码：$pw\n\n这串密码只显示这一次，请抄下来交给 $name。") },
+            confirmButton = { TextButton(onClick = { createdPw = null }) { Text("知道了") } },
+        )
     }
 
     if (resetFor.isNotEmpty()) {
@@ -656,7 +680,7 @@ internal fun GuestSection(api: AuraApi, onNote: (String) -> Unit) {
         AlertDialog(
             onDismissRequest = { confirm = "" },
             title = { Text("删掉这个客人？") },
-            text = { Text("删掉之后对方就登不上来了。") },
+            text = { Text("删掉之后对方就登不上来了，聊天、记忆、日记也会一起清掉，删了就回不来。") },
             confirmButton = {
                 TextButton(onClick = {
                     val subject = confirm
@@ -693,12 +717,9 @@ internal fun AccountSection(api: AuraApi, prefs: Prefs, me: JSONObject?, onLogou
         InfoRow("用户名", me?.optString("name").orEmpty().ifBlank { prefs.user })
         InfoRow("角色", roleLabel(me?.optString("role").orEmpty().ifBlank { prefs.role }))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextButton(onClick = { changing = !changing }) { Text(if (changing) "取消改密码" else "修改密码") }
-            TextButton(onClick = {
-                api.logout()
-                prefs.clearLogin()
-                onLogout()
-            }) { Text("退出登录", color = MaterialTheme.colorScheme.error) }
+            TextButton(onClick = { changing = !changing }) { Text(if (changing) "取消" else "改密码") }
+            // 本地优先：立即回登录页；服务端 /api/logout 由上层做后台 best-effort（失败忽略）
+            TextButton(onClick = { onLogout() }) { Text("退出登录", color = MaterialTheme.colorScheme.error) }
         }
         if (changing) {
             OutlinedTextField(

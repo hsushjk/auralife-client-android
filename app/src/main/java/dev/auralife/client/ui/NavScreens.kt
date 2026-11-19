@@ -73,9 +73,9 @@ fun SpaceScreen(api: AuraApi, owner: Boolean = false, subject: String = "") {
         if (r.isSuccess) data = r.getOrNull() else err = r.exceptionOrNull()?.message ?: "拉不到空间"
     }
 
-    // 空间有新动态时原地刷新
-    LaunchedEffect(Unit) {
-        Live.onAzone = { tick++ }
+    // 空间有新动态时原地刷新：azone 事件由 Live 在 UI 线程递增序号，避免 SSE 线程直接写 Compose
+    LaunchedEffect(Live.azoneSeq) {
+        if (Live.azoneSeq > 0) tick++
     }
 
     val entries = (data?.opt("entries") as? JSONArray ?: JSONArray())
@@ -132,11 +132,12 @@ private fun EntryCard(
         scope.launch {
             val r = runCatching { withContext(Dispatchers.IO) { SettingsApi.diaryComment(api, id, text) } }.getOrNull()
             busy = false
-            if (r?.optBoolean("ok") != false) {
+            // v1.91.78：服务端如实返回 ok:false+reason；网络异常时不当作成功
+            if (r?.optBoolean("ok") == true) {
                 drafts[id] = ""
                 onChanged()
             } else {
-                onNote(r?.optString("reason").orEmpty().ifBlank { "没发出去" })
+                onNote(r?.optString("reason").orEmpty().ifBlank { r?.optString("message").orEmpty() }.ifBlank { "没发出去" })
             }
         }
     }
@@ -228,12 +229,13 @@ private fun CommentRow(
         scope.launch {
             val r = runCatching { withContext(Dispatchers.IO) { SettingsApi.diaryReply(api, entryId, commentId, text) } }.getOrNull()
             busy = false
-            if (r?.optBoolean("ok") != false) {
+            // v1.91.78：服务端如实返回 ok:false+reason；网络异常时不当作成功
+            if (r?.optBoolean("ok") == true) {
                 replyText = ""
                 replying = false
                 onChanged()
             } else {
-                onNote(r?.optString("reason").orEmpty().ifBlank { "没发出去" })
+                onNote(r?.optString("reason").orEmpty().ifBlank { r?.optString("message").orEmpty() }.ifBlank { "没发出去" })
             }
         }
     }

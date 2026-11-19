@@ -44,7 +44,7 @@ import org.json.JSONObject
 import java.io.File
 
 private val OWNER_GROUPS = listOf(
-    "master" to "开关",
+    "master" to "总开关",
     "appearance" to "外观",
     "model" to "模型",
     "reply" to "回复节奏",
@@ -91,12 +91,13 @@ fun SettingsScreen(
         loading = true
         loadErr = null
         val sRes = withContext(Dispatchers.IO) { runCatching { SettingsApi.stateMe(api) } }
-        st = sRes.getOrNull()
+        // 拉不到也保留上一次的值：离线时仍能显示账号区、退出登录（AND-2）
+        sRes.getOrNull()?.let { st = it }
         if (sRes.isFailure) loadErr = "拉不到状态：${sRes.exceptionOrNull()?.message ?: "网络不对"}"
         val role = sRes.getOrNull()?.optJSONObject("me")?.optString("role").orEmpty().ifBlank { prefs.role }
         if (role == "owner") {
             val cRes = withContext(Dispatchers.IO) { runCatching { SettingsApi.config(api) } }
-            cfg = cRes.getOrNull()?.optJSONObject("config")?.let { CfgState(it) }
+            if (cRes.isSuccess) cRes.getOrNull()?.optJSONObject("config")?.let { cfg = CfgState(it) }
             if (cRes.isFailure) loadErr = "拉不到设置：${cRes.exceptionOrNull()?.message ?: "网络不对"}"
         } else {
             cfg = null
@@ -208,7 +209,37 @@ fun SettingsScreen(
                         }
                         item { Hint("这份地址里你是访客，只能改主题、密码和本地缓存；其余设置在主人那边。") }
                     }
-                    c == null -> LoadingRow()
+                    // 配置还没拉到时账号/关于/缓存/退出登录也必须可用（AND-2：离线不能卡在转圈）
+                    c == null -> LazyColumn(
+                        Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        contentPadding = PaddingValues(12.dp),
+                    ) {
+                        item {
+                            when (active) {
+                                "account" -> AccountSection(api, prefs, me, onLogout)
+                                "about" -> AboutCard(prefs, st)
+                                "cache" -> CacheSection(cacheBytes) { clearCache() }
+                                else -> Panel("设置") {
+                                    if (loading) {
+                                        Row(
+                                            Modifier.fillMaxWidth().padding(8.dp),
+                                            horizontalArrangement = Arrangement.Center,
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) { CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) }
+                                    } else {
+                                        Text(
+                                            loadErr ?: "拉不到设置：网络不对",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.error,
+                                        )
+                                        TextButton(onClick = { tick++ }) { Text("重试") }
+                                    }
+                                }
+                            }
+                        }
+                        item { Hint("服务端设置暂时拉不到；但账号、关于、本地缓存和退出登录不受影响。") }
+                    }
                     else -> LazyColumn(
                         Modifier.fillMaxSize(),
                         verticalArrangement = Arrangement.spacedBy(10.dp),

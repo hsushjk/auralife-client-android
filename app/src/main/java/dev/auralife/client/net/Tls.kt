@@ -65,7 +65,9 @@ object Tls {
 fun buildClient(insecure: Boolean): OkHttpClient {
     val b = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // 0 = 不超时，SSE 长连接挂着
+        // 普通请求给 30s；SSE 在读流那一步单独 newBuilder().readTimeout(0)，
+        // 否则半开连接会永久卡住（AND-1 的假死来源之一）
+        .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
     if (insecure) {

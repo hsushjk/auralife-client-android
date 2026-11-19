@@ -23,8 +23,8 @@ android {
         applicationId = "dev.auralife.client"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 19191
+        versionName = "1.91.91"
     }
 
     signingConfigs {
@@ -58,6 +58,11 @@ android {
         compose = true
     }
 
+    // 纯逻辑 JVM 单测不需要真实 Android 方法，避免 "not mocked"
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
@@ -76,4 +81,11 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("androidx.compose.ui:ui-tooling-preview")
+
+    // 纯逻辑单测（退避/取票/去重/登录态/local-first logout）
+    testImplementation("junit:junit:4.13.2")
+    // SSE 取票/一次性票/旧协议回退的本地协议测试
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    // JVM 单测里的 org.json 要真实现，不能用 android.jar 的 stub
+    testImplementation("org.json:json:20240303")
 }

@@ -25,6 +25,7 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -64,6 +65,7 @@ import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Stop
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
@@ -110,7 +112,11 @@ import dev.auralife.client.net.Live
 import dev.auralife.client.net.Media
 import dev.auralife.client.net.FileSend
 import dev.auralife.client.net.Message
+import dev.auralife.client.net.Quote
+import dev.auralife.client.net.QuoteRules
 import dev.auralife.client.net.Recorder
+import dev.auralife.client.net.Reconnect
+import dev.auralife.client.net.SettingsApi
 import dev.auralife.client.net.Sticker
 import dev.auralife.client.net.VoicePlayer
 import dev.auralife.client.net.decodeBytes
@@ -184,7 +190,7 @@ private sealed interface Row {
 }
 
 @Composable
-fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
+fun ChatScreen(api: AuraApi, prefs: Prefs) {
     val list = Live.messages
     var input by remember { mutableStateOf(prefs.draft.ifBlank { "" }) }
     var title by remember { mutableStateOf(prefs.name) }
@@ -203,8 +209,14 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
     var armedPin by remember { mutableStateOf(false) }
     val pending = remember { mutableStateListOf<Pending>() }
     val retries = remember { mutableStateMapOf<String, () -> JSONObject>() }
+    // pending key → 这条发送附带的引用快照（发送成功才清空 pendingQuote）
+    val quotes = remember { mutableStateMapOf<String, Quote>() }
     // mediaId → 本地缓存文件（仅内存）
-    val downloadedDocs = remember { mutableStateMapOf<String, File>() }
+    var downloadedDocs = remember { mutableStateMapOf<String, File>() }
+    var fileAsk by remember { mutableStateOf<List<FileSend>?>(null) }
+    // v1.91.78 引用：正在引用的消息快照；跳转后短暂高亮的消息 id
+    var pendingQuote by remember { mutableStateOf<Quote?>(null) }
+    var flashId by remember { mutableStateOf("") }
     val ctx = LocalContext.current
     val recorder = remember { Recorder(ctx) }
     val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -237,8 +249,7 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
     }
 
     LaunchedEffect(Unit) {
-        Live.start(ctx, api)
-        Live.reload()
+        Live.start(api)
         if (Live.botName.isNotBlank()) title = Live.botName
     }
 
@@ -246,6 +257,15 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
     LaunchedEffect(input) {
         kotlinx.coroutines.delay(500)
         prefs.draft = input
+    }
+
+    // rotate 只代表换了一段 session：消息原地保留，提示一句（Live 已自动重拉最新页）
+    LaunchedEffect(Live.rotateSeq) {
+        if (Live.rotateSeq > 0) {
+            note = Reconnect.MSG_ROTATE_CHAT
+            kotlinx.coroutines.delay(4000)
+            if (note == Reconnect.MSG_ROTATE_CHAT) note = ""
+        }
     }
 
     val rows = remember(list.toList(), query, pending.toList()) { buildRows(list, query, pending) }
@@ -302,10 +322,18 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
     }
 
 
-    fun track(kind: String, preview: String, dur: Int = 0, name: String = "", send: () -> JSONObject) {
+    fun track(
+        kind: String,
+        preview: String,
+        dur: Int = 0,
+        name: String = "",
+        quote: Quote? = null,
+        send: () -> JSONObject,
+    ) {
         val key = "p" + System.nanoTime()
         pending.add(Pending(key, kind, preview, dur, name))
         retries[key] = send
+        if (quote != null) quotes[key] = quote
         Thread {
             val r = runCatching { send() }.getOrNull()
             val ok = r?.optBoolean("ok") == true || r?.has("messages") == true
@@ -319,8 +347,13 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
                         pending.removeAll { it.key == key }
                     }
                     retries.remove(key)
+                    // 引用发送成功才清空；失败保留，重试时继续带同一条引用
+                    val q = quotes.remove(key)
+                    if (q != null && pendingQuote?.id == q.id) pendingQuote = null
                 } else {
-                    val reason = r?.optString("reason").orEmpty().ifBlank { "没网了吧" }
+                    val reason = r?.optString("reason").orEmpty().ifBlank {
+                        if (kind == "voice") "语音没发出去" else "网络不通，点重试再发一次"
+                    }
                     if (kind == "file") note = reason
                     val i = pending.indexOfFirst { it.key == key }
                     if (i >= 0) pending[i] = pending[i].copy(sending = false, error = reason)
@@ -345,12 +378,76 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
                         pending.removeAll { it.key == p.key }
                     }
                     retries.remove(p.key)
+                    val q = quotes.remove(p.key)
+                    if (q != null && pendingQuote?.id == q.id) pendingQuote = null
                 } else {
                     val i2 = pending.indexOfFirst { it.key == p.key }
-                    if (i2 >= 0) pending[i2] = p.copy(sending = false, error = r?.optString("reason").orEmpty().ifBlank { "还是不行" })
+                    if (i2 >= 0) pending[i2] = p.copy(sending = false, error = r?.optString("reason").orEmpty().ifBlank { "网络不通，点重试再发一次" })
                 }
             }
         }.apply { isDaemon = true }.start()
+    }
+
+    fun botDisplayName(): String = Live.botName.ifBlank { title.ifBlank { "Ta" } }
+
+    /** 长按菜单「引用这条」：把消息变成快照放进输入区预览条。 */
+    fun onQuoteMessage(m: Message) {
+        val q = QuoteRules.snapshot(m) ?: return
+        pendingQuote = q
+        note = ""
+        showStickers = false
+    }
+
+    /**
+     * 点击引用块跳到被引用的消息（web focusQuoted 同流程）：
+     * ①本地按 id 找 → 滚动 + 1.4s 高亮；
+     * ②找不到 → GET api/messages/locate?id= 反查 → 从当前最老往前翻页（上限 200 页）；
+     * ③仍找不到 → 提示「那条消息不在当前加载的记录里」。
+     */
+    fun jumpToQuote(q: Quote) {
+        scope.launch {
+            fun rowsNow(): List<Row> = buildRows(Live.messages.toList(), "", emptyList())
+            fun findIndex(): Int = rowsNow().indexOfFirst { it is Row.Item && it.m.id == q.id }
+
+            var idx = findIndex()
+            if (idx < 0) {
+                val loc = withContext(Dispatchers.IO) { runCatching { api.locate(q.id) }.getOrNull() }
+                if (loc?.optBoolean("ok") != true) {
+                    note = QuoteRules.locateFailure(loc?.optString("reason").orEmpty())
+                    return@launch
+                }
+                val locT = loc.optJSONObject("message")?.optLong("t", 0L) ?: 0L
+                val oldest = Live.messages.firstOrNull()?.t ?: 0L
+                // 目标 t 比当前最老还新却搜不到：多半已被过期清理，不再翻页
+                val mayPage = !(locT > 0 && oldest > 0 && locT >= oldest)
+                var pages = 0
+                while (mayPage && findIndex() < 0 && Live.hasMore && pages < 200) {
+                    Live.loadOlder()
+                    pages++
+                    var waited = 0
+                    while (Live.loadingOlder && waited < 300) {
+                        kotlinx.coroutines.delay(20)
+                        waited++
+                    }
+                }
+                idx = findIndex()
+                if (idx < 0) {
+                    note = QuoteRules.MSG_NOT_LOADED
+                    return@launch
+                }
+            }
+            val rs = rowsNow()
+            val target = rs.indexOfFirst { it is Row.Item && it.m.id == q.id }
+            if (target < 0) {
+                note = QuoteRules.MSG_NOT_LOADED
+                return@launch
+            }
+            // reverseLayout：index 0 在最底
+            state.animateScrollToItem(rs.size - 1 - target)
+            flashId = q.id
+            kotlinx.coroutines.delay(1400)
+            if (flashId == q.id) flashId = ""
+        }
     }
 
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -363,22 +460,19 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
             for (u in uris) {
                 val f = readFileSend(ctx, u) ?: continue
                 if (f.dataUri.isEmpty()) { empty++; continue }
-                if (f.dataUri.length > 30 * 1024 * 1024) { tooBig++; continue } // 服务端 30MB 上限
+                // 请求体 32MB、单文件 data ≥30MB 服务端静默丢弃；base64 会膨胀，按约 24MB 本地拦截
+                if (f.dataUri.length > 24 * 1024 * 1024) { tooBig++; continue }
                 out.add(f)
             }
             ui.post {
                 note = ""
                 when {
-                    tooBig > 0 && out.isEmpty() && empty == 0 -> note = "文件太大了（单文件 ≤30MB）"
-                    out.isEmpty() && empty > 0 -> note = "这是空文件"
+                    tooBig > 0 -> note = "超过传输上限（约 24MB），发不了。拆开发或换小的。"
+                    empty > 0 && out.isEmpty() -> note = "这是空文件"
                     out.isEmpty() -> note = "文件读不出来"
                     else -> {
                         if (empty > 0) note = "这是空文件"
-                        track(
-                            "file",
-                            "[文件] " + out.joinToString("、") { it.name }.take(80),
-                            name = out.joinToString("、") { it.name }.take(80),
-                        ) { api.sendFiles(out) }
+                        fileAsk = out
                     }
                 }
             }
@@ -389,6 +483,14 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
         if (uri == null) return@rememberLauncherForActivityResult
         note = "正在发图…"
         Thread {
+            // 图片本地限制 10MB（spec §1.5）
+            val size = runCatching {
+                ctx.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+            }.getOrDefault(0L)
+            if (size > 10L * 1024 * 1024) {
+                ui.post { note = "图片太大了（最多 10MB）" }
+                return@Thread
+            }
             val ready = runCatching { prepareImage(ctx, uri) }.getOrNull()
             if (ready == null) {
                 ui.post { note = "这张图读不出来" }
@@ -396,9 +498,28 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
             }
             ui.post {
                 note = ""
-                track("image", "[图片]") { api.sendImage(ready.first, ready.second) }
+                val q = pendingQuote
+                track("image", "[图片]", quote = q) { api.sendImage(ready.first, ready.second, quote = q) }
             }
         }.apply { isDaemon = true }.start()
+    }
+
+    // 发文件前确认（web：把这些文件发给 Ta？）
+    fileAsk?.let { files ->
+        AlertDialog(
+            onDismissRequest = { fileAsk = null },
+            title = { Text("把这些文件发给 Ta？") },
+            text = { Text(files.joinToString("\n") { it.name }) },
+            confirmButton = {
+                TextButton(onClick = {
+                    fileAsk = null
+                    val names = files.joinToString("、") { it.name }.take(80)
+                    val q = pendingQuote
+                    track("file", "[文件] $names", name = names, quote = q) { api.sendFiles(files, q) }
+                }) { Text("发送") }
+            },
+            dismissButton = { TextButton(onClick = { fileAsk = null }) { Text("算了") } },
+        )
     }
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
@@ -498,16 +619,32 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
                             )
                         }
                     }
-                    Text(
-                        when {
-                            recording -> "正在录音…再按一下发出去"
-                            typing -> "对方正在输入…"
-                            online -> "已连接"
-                            else -> "连接断了，正在重试"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (recording) MaterialTheme.colorScheme.error else Color.Unspecified,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            when {
+                                recording -> "正在录音…再按一下发出去"
+                                typing -> "${Live.botName.ifBlank { title.ifBlank { "Ta" } }} 正在输入…"
+                                Live.connectFailed -> Reconnect.MSG_CONNECT_FAILED
+                                Live.ticketFailed -> "实时连接凭证获取失败，正在重试…"
+                                online -> "已连接"
+                                else -> "连接断了，正在自动重连…"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (recording) MaterialTheme.colorScheme.error else Color.Unspecified,
+                        )
+                        // 断线/「连接失败」时给一个可见的手动重试入口
+                        if (!online) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "重试",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .clickable { Live.retryNow() }
+                                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
                 }
                 if (note.isNotEmpty()) {
                     Text(note, style = MaterialTheme.typography.bodySmall, color = Color.Gray, modifier = Modifier.padding(end = 4.dp))
@@ -531,7 +668,16 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
                 items(rows.asReversed(), key = { it.key }) { row ->
                     when (row) {
                         is Row.Sep -> DayDivider(row.label)
-                        is Row.Item -> Bubble(api, row.m, downloadedDocs)
+                        is Row.Item -> Bubble(
+                            api = api,
+                            m = row.m,
+                            downloaded = downloadedDocs,
+                            botName = botDisplayName(),
+                            flash = flashId == row.m.id,
+                            canQuote = Reconnect.supportsQuote(api.serverVersion),
+                            onQuote = { onQuoteMessage(it) },
+                            onJumpQuote = { jumpToQuote(it) },
+                        )
                         is Row.Fail -> FailBubble(row.p, onRetry = { retry(row.p) }, onDrop = {
                             pending.removeAll { it.key == row.p.key }
                             retries.remove(row.p.key)
@@ -574,6 +720,33 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
                             Text(if (unread > 99) "99+" else unread.toString(), style = MaterialTheme.typography.labelMedium)
                         }
                     }
+                }
+            }
+        }
+
+        // 输入区上方的引用预览条（v1.91.78）
+        pendingQuote?.let { q ->
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, bottom = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    Modifier
+                        .width(3.dp)
+                        .height(28.dp)
+                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    QuoteRules.quoteLine(q, botDisplayName()),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = { pendingQuote = null }, modifier = Modifier.size(28.dp)) {
+                    Icon(Icons.Outlined.Close, contentDescription = "取消引用", modifier = Modifier.size(16.dp))
                 }
             }
         }
@@ -627,7 +800,8 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
                         note = "太短了，没发出去"
                     } else {
                         note = ""
-                        track("voice", "[语音 ${got.second}s]", got.second) { api.sendVoice(got.first, "audio/wav", got.second) }
+                        val q = pendingQuote
+                        track("voice", "[语音 ${got.second}s]", got.second, quote = q) { api.sendVoice(got.first, "audio/wav", got.second, q) }
                     }
                 } else if (androidx.core.content.ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                     askMic.launch(Manifest.permission.RECORD_AUDIO)
@@ -646,7 +820,8 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
                     val t = input.trim()
                     input = ""
                     prefs.draft = ""
-                    track("text", t) { api.send(t) }
+                    val q = pendingQuote
+                    track("text", t, quote = q) { api.send(t, q) }
                 },
             ) { Text("发送") }
         }
@@ -656,7 +831,8 @@ fun ChatScreen(api: AuraApi, prefs: Prefs, onLogout: () -> Unit) {
             api = api,
             stickers = stickers,
             onPick = { s ->
-                track("sticker", "[表情] ${s.name}".trim()) { api.sendSticker(s.md5) }
+                val q = pendingQuote
+                track("sticker", "[表情] ${s.name}".trim(), quote = q) { api.sendSticker(s.md5, q) }
             },
         )
     }
@@ -792,7 +968,7 @@ private fun StickerPanel(
         ) {
             if (stickers.isEmpty()) {
                 Text(
-                    "表情库还是空的",
+                    "表情库还是空的，去设置里传几张",
                     Modifier.padding(24.dp),
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color.Gray,
@@ -848,7 +1024,16 @@ private fun LoadedBitmap(key: String, load: suspend () -> Bitmap?, modifier: Mod
 }
 
 @Composable
-private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File>) {
+private fun Bubble(
+    api: AuraApi,
+    m: Message,
+    downloaded: MutableMap<String, File>,
+    botName: String = "Ta",
+    flash: Boolean = false,
+    canQuote: Boolean = false,
+    onQuote: (Message) -> Unit = {},
+    onJumpQuote: (Quote) -> Unit = {},
+) {
     val mine = m.who == "user"
     val rowMod = Modifier.fillMaxWidth()
     val arrangement = if (mine) Arrangement.End else Arrangement.Start
@@ -877,31 +1062,42 @@ private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File
         }
         if (ready) {
             val gif = isGif(file)
+            val flashMod = if (flash) {
+                Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(10.dp))
+            } else {
+                Modifier
+            }
             Box {
                 Row(rowMod, horizontalArrangement = arrangement) {
-                    if (gif) {
-                        AnimatedImage(
-                            file,
-                            Modifier
-                                .size(120.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .combinedClickable(onClick = {}, onLongClick = { menu = true }),
-                        )
-                    } else {
-                        LoadedBitmap(
-                            key = "sticker:" + m.sticker,
-                            load = { decodeBytes(file.readBytes(), 360) },
-                            modifier = Modifier
-                                .size(120.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .combinedClickable(onClick = {}, onLongClick = { menu = true }),
-                        )
+                    Column(Modifier.widthIn(max = 240.dp)) {
+                        m.quote?.let { QuoteBlock(it, botName) { onJumpQuote(it) } }
+                        if (gif) {
+                            AnimatedImage(
+                                file,
+                                Modifier
+                                    .size(120.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .then(flashMod)
+                                    .combinedClickable(onClick = {}, onLongClick = { menu = true }),
+                            )
+                        } else {
+                            LoadedBitmap(
+                                key = "sticker:" + m.sticker,
+                                load = { decodeBytes(file.readBytes(), 360) },
+                                modifier = Modifier
+                                    .size(120.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .then(flashMod)
+                                    .combinedClickable(onClick = {}, onLongClick = { menu = true }),
+                            )
+                        }
                     }
                 }
                 BubbleMenu(
                     expanded = menu,
                     onDismiss = { menu = false },
                     onCopy = { menu = false; copyText() },
+                    onQuote = if (canQuote) { { menu = false; onQuote(m) } } else null,
                 )
             }
         }
@@ -934,41 +1130,52 @@ private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File
                 else decodeInline(m.image, BIG_SIDE)
             }
         }
+        val flashMod = if (flash) {
+            Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))
+        } else {
+            Modifier
+        }
         Box {
             Row(rowMod, horizontalArrangement = arrangement) {
-                when {
-                    thumb != null -> {
-                        // GIF 用动画解码，<API28 回退静态
-                        val gifFile = m.mediaId.takeIf { it.isNotEmpty() }?.let { Media.cached(ctx, it) }?.takeIf { isGif(it) }
-                        if (gifFile != null) {
-                            AnimatedImage(
-                                gifFile,
-                                Modifier
-                                    .widthIn(min = 120.dp, max = 240.dp)
-                                    .heightIn(max = 240.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .combinedClickable(onClick = { open = true }, onLongClick = { menu = true }),
-                            )
-                        } else {
-                            Image(
-                                bitmap = thumb!!.asImageBitmap(),
-                                contentDescription = null,
-                                modifier = Modifier
-                                    .widthIn(min = 120.dp, max = 240.dp)
-                                    .heightIn(max = 240.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .combinedClickable(onClick = { open = true }, onLongClick = { menu = true }),
-                            )
+                Column(Modifier.widthIn(max = 260.dp)) {
+                    m.quote?.let { QuoteBlock(it, botName) { onJumpQuote(it) } }
+                    when {
+                        thumb != null -> {
+                            // GIF 用动画解码，<API28 回退静态
+                            val gifFile = m.mediaId.takeIf { it.isNotEmpty() }?.let { Media.cached(ctx, it) }?.takeIf { isGif(it) }
+                            if (gifFile != null) {
+                                AnimatedImage(
+                                    gifFile,
+                                    Modifier
+                                        .widthIn(min = 120.dp, max = 240.dp)
+                                        .heightIn(max = 240.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .then(flashMod)
+                                        .combinedClickable(onClick = { open = true }, onLongClick = { menu = true }),
+                                )
+                            } else {
+                                Image(
+                                    bitmap = thumb!!.asImageBitmap(),
+                                    contentDescription = null,
+                                    modifier = Modifier
+                                        .widthIn(min = 120.dp, max = 240.dp)
+                                        .heightIn(max = 240.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .then(flashMod)
+                                        .combinedClickable(onClick = { open = true }, onLongClick = { menu = true }),
+                                )
+                            }
                         }
+                        // 服务端按 keepDays 清理后媒体失效
+                        gone -> GoneBubble(mine)
                     }
-                    // 服务端按 keepDays 清理后媒体失效
-                    gone -> GoneBubble(mine)
                 }
             }
             BubbleMenu(
                 expanded = menu,
                 onDismiss = { menu = false },
                 onCopy = null,
+                onQuote = if (canQuote) { { menu = false; onQuote(m) } } else null,
                 onSaveImage = thumb?.let { fallback ->
                     {
                         menu = false
@@ -1073,7 +1280,11 @@ private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File
                     else Modifier.widthIn(max = 300.dp),
                 )
                 .background(
-                    if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                    when {
+                        flash -> MaterialTheme.colorScheme.tertiaryContainer
+                        mine -> MaterialTheme.colorScheme.primaryContainer
+                        else -> MaterialTheme.colorScheme.surfaceVariant
+                    },
                     RoundedCornerShape(12.dp),
                 )
                 .then(
@@ -1088,6 +1299,7 @@ private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File
                 )
                 .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
+            m.quote?.let { QuoteBlock(it, botName) { onJumpQuote(it) } }
             when (m.kind) {
                 "sticker" -> Text(m.caption.ifBlank { m.name.ifBlank { "[表情]" } })
                 "image" -> Text(if (mine) "[图片]" else "[Ta 发来一张图]")
@@ -1132,27 +1344,38 @@ private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File
                         }
                     }
                 }
-                "voice" -> Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = if (isPlaying) Icons.Outlined.Stop else Icons.Outlined.PlayArrow,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    VoiceBars(progress = if (isPlaying) progress else 0f, playing = isPlaying)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        when {
-                            gone -> "语音已过期"
-                            downloading -> "下载中…"
-                            isPlaying -> "${posSec.coerceAtLeast(0)}″ / ${m.dur}″"
-                            m.dur > 0 -> "${m.dur}″"
-                            else -> "语音"
-                        },
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
+                "voice" -> Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Outlined.Stop else Icons.Outlined.PlayArrow,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        VoiceBars(progress = if (isPlaying) progress else 0f, playing = isPlaying)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            when {
+                                gone -> "[语音已过期]"
+                                downloading -> "下载中…"
+                                isPlaying -> "${posSec.coerceAtLeast(0)}″ / ${m.dur}″"
+                                m.dur > 0 -> "${m.dur}″"
+                                else -> "语音"
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                    // 服务端 ASR 转写后同 id 重发，带 heard
+                    if (m.heard.isNotBlank()) {
+                        Text(
+                            "听成了：${m.heard}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
                 }
                 else -> Text(m.text)
             }
@@ -1170,8 +1393,40 @@ private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File
             BubbleMenu(
                 expanded = menu,
                 onDismiss = { menu = false },
+                onQuote = if (canQuote) { { menu = false; onQuote(m) } } else null,
                 onCopy = if (m.kind == "text") {
                     { menu = false; copyText() }
+                } else null,
+                onSaveImage = if (m.kind == "image") {
+                    {
+                        menu = false
+                        Thread {
+                            val bmp = if (m.mediaId.isNotEmpty()) {
+                                api.mediaBytes(m.mediaId)?.let { decodeBytes(it, BIG_SIDE) }
+                            } else {
+                                decodeInline(m.image, BIG_SIDE)
+                            }
+                            val ok = bmp != null && saveImage(ctx, bmp, "auralife-" + m.id.take(8))
+                            ui_tip(tip = { s -> tip = s }, ok)
+                        }.apply { isDaemon = true }.start()
+                    }
+                } else null,
+                // 收进表情库：把聊天里的图存成表情（web 同功能）
+                onSticker = if (m.kind == "image") {
+                    {
+                        menu = false
+                        Thread {
+                            val bytes = if (m.mediaId.isNotEmpty()) {
+                                api.mediaBytes(m.mediaId)
+                            } else {
+                                runCatching { Base64.decode(m.image, Base64.DEFAULT) }.getOrNull()
+                            }
+                            val ok = bytes != null && runCatching {
+                                SettingsApi.uploadSticker(api, Base64.encodeToString(bytes, Base64.NO_WRAP), "来自聊天").optBoolean("ok")
+                            }.getOrDefault(false)
+                            ui_tip(tip = { s -> tip = s }, ok)
+                        }.apply { isDaemon = true }.start()
+                    }
                 } else null,
                 onSaveVoice = if (m.kind == "voice") {
                     {
@@ -1196,16 +1451,60 @@ private fun Bubble(api: AuraApi, m: Message, downloaded: MutableMap<String, File
 private fun BubbleMenu(
     expanded: Boolean,
     onDismiss: () -> Unit,
+    onQuote: (() -> Unit)? = null,
     onCopy: (() -> Unit)? = null,
     onSaveImage: (() -> Unit)? = null,
     onSaveVoice: (() -> Unit)? = null,
+    onSticker: (() -> Unit)? = null,
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        if (onQuote != null) DropdownMenuItem(text = { Text("引用这条") }, onClick = onQuote)
         if (onCopy != null) DropdownMenuItem(text = { Text("复制文字") }, onClick = onCopy)
         if (onSaveImage != null) DropdownMenuItem(text = { Text("保存图片") }, onClick = onSaveImage)
+        if (onSticker != null) DropdownMenuItem(text = { Text("收进表情库") }, onClick = onSticker)
         if (onSaveVoice != null) DropdownMenuItem(text = { Text("保存语音") }, onClick = onSaveVoice)
-        if (onCopy == null && onSaveImage == null && onSaveVoice == null) {
+        if (onQuote == null && onCopy == null && onSaveImage == null && onSaveVoice == null && onSticker == null) {
             DropdownMenuItem(text = { Text("长按没有可用操作") }, onClick = onDismiss, enabled = false)
+        }
+    }
+}
+
+/**
+ * 气泡里的引用块：左侧竖线 + 引用人 + 快照（单行省略），点击跳到被引用的消息。
+ * 显示直接用服务端返回的 quote.text；引用人 bot 显示 Ta 的名字，其余显示「你」。
+ */
+@Composable
+private fun QuoteBlock(q: Quote, botName: String, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(bottom = 6.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.55f))
+            .clickable { onClick() }
+            .padding(vertical = 3.dp, horizontal = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .width(3.dp)
+                .height(26.dp)
+                .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)),
+        )
+        Spacer(Modifier.width(6.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                QuoteRules.quoteName(q, botName),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                q.text,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -1352,7 +1651,7 @@ private fun VoiceBars(progress: Float, playing: Boolean) {
 @Composable
 private fun GoneBubble(mine: Boolean) {
     Text(
-        if (mine) "[图片] 已过期" else "[图片已过期]",
+        if (mine) "图片已经过期了" else "图片已经过期了",
         style = MaterialTheme.typography.bodyMedium,
         color = Color.Gray,
         modifier = Modifier
@@ -1389,9 +1688,9 @@ private data class DebugAction(
 
 private val debugGroups: List<Pair<String, List<DebugAction>>> = listOf(
     "记忆" to listOf(
-        DebugAction("mem-list", "列记忆", "memory", "list"),
-        DebugAction("mem-seed", "造测试记忆", "memory", "seed", """{"facts":[{"text":"测试事实：主人最近喜欢喝热水","conf":0.7,"tags":["debug"]}]}"""),
-        DebugAction("mem-forget", "忘一条", "memory", "forget", """{"id":""}"""),
+        DebugAction("mem-list", "列事实", "memory", "list"),
+        DebugAction("mem-seed", "种子", "memory", "seed", """{"facts":[{"text":"测试事实：主人最近喜欢喝热水","conf":0.7,"tags":["debug"]}]}"""),
+        DebugAction("mem-forget", "忘掉一条", "memory", "forget", """{"id":""}"""),
         DebugAction("mem-consolidate", "整理对话", "memory", "consolidate", burn = true),
         DebugAction("mem-replay", "记忆重放", "memory", "replay", burn = true),
         DebugAction("mem-clear", "清空记忆", "memory", "clear", danger = true),
@@ -1409,7 +1708,7 @@ private val debugGroups: List<Pair<String, List<DebugAction>>> = listOf(
     "执念" to listOf(
         DebugAction("wish-list", "列执念", "wishes", "list"),
         DebugAction("wish-add", "加一条", "wishes", "add", """{"text":"debug 执念"}"""),
-        DebugAction("wish-resolve", "了结", "wishes", "resolve", """{"text":""}"""),
+        DebugAction("wish-resolve", "了结一条", "wishes", "resolve", "{}"),
         DebugAction("wish-clear", "清空执念", "wishes", "clear", danger = true),
     ),
     "自我" to listOf(
@@ -1429,7 +1728,7 @@ private val debugGroups: List<Pair<String, List<DebugAction>>> = listOf(
         DebugAction("alarm-clear", "清空闹钟", "alarm", "clear", danger = true),
     ),
     "聊天" to listOf(
-        DebugAction("chat-inject", "注入假消息", "chat", "inject", """{"who":"user","text":"debug 假消息"}"""),
+        DebugAction("chat-inject", "注入消息", "chat", "inject", """{"who":"user","text":"debug 假消息"}"""),
         DebugAction("chat-prune", "裁剪记录", "chat", "prune", danger = true),
     ),
     "跑一轮" to listOf(
@@ -1453,6 +1752,18 @@ private fun DebugDialog(api: AuraApi, onClose: () -> Unit) {
         val parsed = runCatching { JSONObject(body) }.getOrNull()
         if (parsed == null) {
             out = "参数不是合法 JSON，改好再执行"
+            return
+        }
+        // 这些动作必须带定位参数，否则空参发过去只会得到「没找到」
+        val required = when (a.key) {
+            "mem-forget" -> listOf("id")
+            "wish-resolve" -> listOf("id", "text")
+            "self-remove" -> listOf("label")
+            "alarm-cancel" -> listOf("id")
+            else -> emptyList()
+        }
+        if (required.isNotEmpty() && required.none { parsed.optString(it).isNotBlank() }) {
+            out = "先填参数：${required.joinToString(" 或 ")} 至少填一个"
             return
         }
         busy = true
@@ -1505,7 +1816,7 @@ private fun DebugDialog(api: AuraApi, onClose: () -> Unit) {
                     TextButton(onClick = onClose) { Text("关闭") }
                 }
                 Text(
-                    "只有标「会烧 token」的动作消耗模型额度",
+                    "只有标「（调模型）」的动作会消耗模型额度",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1530,7 +1841,7 @@ private fun DebugDialog(api: AuraApi, onClose: () -> Unit) {
                                     ) {
                                         Text(
                                             if (confirming) "再点一下确认"
-                                            else a.label + if (a.burn) "（会烧 token）" else "",
+                                            else a.label + if (a.burn) "（调模型）" else "",
                                             fontSize = 12.sp,
                                         )
                                     }

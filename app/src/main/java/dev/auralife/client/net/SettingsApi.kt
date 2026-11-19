@@ -66,11 +66,15 @@ object SettingsApi {
 
     fun guests(api: AuraApi): JSONObject = api.call("api/guests")
 
-    fun addGuest(api: AuraApi, username: String, displayName: String, note: String, level: String): JSONObject =
-        api.call(
-            "api/guests",
-            JSONObject().put("username", username).put("displayName", displayName).put("note", note).put("level", level),
-        )
+    /** 创建客人的请求体：v1.91.78 起服务端忽略 level，客户端不再发送。 */
+    fun addGuestBody(username: String, displayName: String, note: String): JSONObject =
+        JSONObject().put("username", username).put("displayName", displayName).put("note", note)
+
+    fun addGuest(api: AuraApi, username: String, displayName: String, note: String): JSONObject =
+        api.call("api/guests", addGuestBody(username, displayName, note))
+
+    /** 重置/修改客人密码的请求体（同样不带 level）。 */
+    fun guestPasswordBody(password: String): JSONObject = JSONObject().put("password", password)
 
     fun patchGuest(api: AuraApi, subject: String, body: JSONObject): JSONObject =
         api.call("api/guests/" + URLEncoder.encode(subject, "UTF-8"), body, "PATCH")
