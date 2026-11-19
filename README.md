@@ -1,6 +1,13 @@
 # auralife-client-android
 
-DSH 插件 [dsh-auralife](https://github.com/hsushjk/dsh-auralife) 的安卓客户端：Kotlin + Jetpack Compose。协议与 [Windows 端](https://github.com/hsushjk/auralife-client-win) 一致：HTTP + Bearer token + JSON，实时消息走 SSE。
+DSH 插件 [dsh-auralife](https://github.com/hsushjk/dsh-auralife) 的安卓客户端，协议与 [Windows 端](https://github.com/hsushjk/auralife-client-win) 一致
+
+**系统要求**
+
+- 本客户端使用 `Kotlin + Jetpack Compose`
+- 理论最低系统要求：Android 8.0
+- 推荐系统：Android 15+
+- 兼容：arm64-v8a / armeabi-v7a / x86 / x86_64
 
 **入口 / 连接**
 
